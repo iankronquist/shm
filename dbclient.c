@@ -27,20 +27,33 @@ struct db_info {
     size_t size;
     int fd;
     char *data;
+    void *lock;
 };
 
 
 int get_info(char *hostname, struct ip_row* row);
+struct ip_row *get_row(char *hostname, struct db_info *db);
 void repl();
 void print_row(struct ip_row* row);
 char *init_shm();
 void append_row(struct ip_row *row);
+void append_if_not_present(char *host_name);
 int get_fd_size(int fd);
 void clear();
 void show();
 void errorexit(char *message);
-void open_db(struct db_info *db);
+int open_db(struct db_info *db);
 void close_db(struct db_info *db);
+int cmd_exit();
+void unlock(char *hostname);
+void lock(char *hostname);
+void querylock(char *hostname);
+int writeall();
+void save(char *file_name);
+void load(char *file_name);
+void lock_table();
+void unlock_table();
+void querylock_table();
 
 int main() {
     repl();
@@ -53,22 +66,57 @@ void repl() {
     ssize_t linelen;
     printf("%s", PROMPT);
     while ((linelen = getline(&line, &linecap, stdin)) > 0) {
+        // remove \n
+        line[linelen-1] = '\0';
         if (strstr(line, "fetch") > 0)  {
-            struct ip_row row;
-            line[linelen-1] = '\0';
-            get_info(&line[6], &row); 
-            print_row(&row);
-            append_row(&row);
+            append_if_not_present(&line[6]);
         } else if(strstr(line, "clear")) {
            clear(); 
         } else if(strstr(line, "show")) {
             show();
+        } else if(strstr(line, "exit")) {
+            cmd_exit();
+        } else if(strstr(line, "lock_table")) {
+            //TODO fix design flaw: open_db locks whole table
+            puts("broken");
+            lock_table();
+        } else if(strstr(line, "unlock_table")) {
+            //TODO fix design flaw: open_db locks whole table
+            puts("broken");
+            unlock_table();
+        } else if(strstr(line, "query_table")) {
+            puts("broken?");
+            //TODO fix design flaw: open_db locks whole table
+            querylock_table();
+        } else if(strstr(line, "unlock")) {
+            unlock(&line[7]);
+        }  else if(strstr(line, "lock")) {
+            lock(&line[5]);
+        } else if(strstr(line, "query")) {
+            querylock(&line[6]);
+        } else if(strstr(line, "write")) {
+            writeall();
+        } else if(strstr(line, "load")) {
+            load(&line[5]);
+        } else if(strstr(line, "save")) {
+            save(&line[5]);
         } else {
             puts("Invalid command!");
         }
         printf("\n%s", PROMPT);
     }
     return;
+}
+
+int writeall() {
+     struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("The database is empty");
+        return 1;
+    }
+    write(STDOUT_FILENO, db.data, db.size);
+    close_db(&db);
+    return 0;
 }
 
 int get_info(char *hostname, struct ip_row* row) {
@@ -108,38 +156,77 @@ void print_row(struct ip_row* row) {
     printf("%s", row->row_address6);
 }
 
+void append_if_not_present(char *host_name) {
+    struct db_info db;
+    struct ip_row row;
+    // Will return -1 if the db is empty. If it's empty, append the row
+    if (open_db(&db) != -1) {
+       // Will return a pointer to the row if it exists in the database,
+       // else NULL
+       struct ip_row *row_in_db = get_row(host_name, &db);
+       if (row_in_db != NULL) {
+            // If the row exists, print it and return, otherwise add it.
+            print_row(row_in_db);
+            close_db(&db);
+            return;
+       }
+       close_db(&db);
+    }
+    // Since the row does not exist, get its name, print it, and append it
+    get_info(host_name, &row); 
+    print_row(&row);
+    append_row(&row);
+}
+
 void append_row(struct ip_row *row) {
-    char *addr;
-    int shmfd;
+    struct db_info db;
     char *name = malloc(NAME_SIZE);
     SHARED_MEM_NAME(name);
-    //row->row_lock = sem_open(row->row_name, O_CREAT, S_IWUSR | S_IRUSR, 0);
     if (sem_init(&row->row_lock, 1, 1) == -1) {
         errorexit("Error initializing semaphore");
     }
  
-    shmfd = shm_open(name, O_CREAT | O_RDWR, S_IWUSR | S_IRUSR);
-    if (shmfd == -1) {
+    db.fd = shm_open(name, O_CREAT | O_RDWR, S_IWUSR | S_IRUSR);
+    if (db.fd == -1) {
        errorexit("shm_open");
     }
 
-    int db_original_size = get_fd_size(shmfd);
-    int db_size = db_original_size + sizeof(struct ip_row);
+    int db_original_size = get_fd_size(db.fd);
+    if (db_original_size == 0) {
+        puts("db is empty");
+        db.size = sizeof(sem_t) + sizeof(struct ip_row);
+    } else {
+        db.size = db_original_size + sizeof(struct ip_row);
+    }
+    db.size = db_original_size + sizeof(struct ip_row);
 
-    if (ftruncate(shmfd, db_size) == -1) {
+    if (ftruncate(db.fd, db.size) == -1) {
         errorexit("ftruncate");
     }
-    addr = mmap(NULL, db_size, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);
-    if (addr == -1) {
+    db.lock = mmap(NULL, db.size, PROT_READ | PROT_WRITE, MAP_SHARED, db.fd, 0);
+    db.data = db.lock + sizeof(sem_t);
+    if (db.data == (char *)-1) {
         errorexit("mmap failed");
     }
-    memcpy(addr + db_original_size, row, sizeof(struct ip_row));
-    munmap(addr, db_size);
-    close(shmfd);
+    if (db_original_size == 0) {
+        if (sem_init(db.lock, 1, 1) == -1) {
+            errorexit("Error initializing semaphore");
+        }
+    }
+    if(sem_wait(db.lock) == -1) {
+        errorexit("Error locking");
+    }
+    memcpy(db.data + db_original_size, row, sizeof(struct ip_row));
+    if (sem_post(db.lock) == -1) {
+        errorexit("Error unlocking");
+    }
+    munmap(db.lock, db.size);
+    close(db.fd);
+    free(name);
 }
 
 
-void open_db(struct db_info *db) {
+int open_db(struct db_info *db) {
     char *name = malloc(NAME_SIZE);
     SHARED_MEM_NAME(name);
  
@@ -150,17 +237,30 @@ void open_db(struct db_info *db) {
 
     db->size = get_fd_size(db->fd);
 
+    if (db->size == 0) {
+       close(db->fd);
+       return -1;
+    }
     if (ftruncate(db->fd, db->size) == -1) {
         errorexit("ftruncate");
     }
-    db->data = mmap(NULL, db->size, PROT_READ | PROT_WRITE, MAP_SHARED, db->fd, 0);
-    if (db->data == -1) {
+    db->lock = mmap(NULL, db->size, PROT_READ | PROT_WRITE, MAP_SHARED, db->fd, 0);
+    db->data = db->lock + sizeof(sem_t);
+    if (db->data == (char *)-1) {
         errorexit("mmap failed");
     }
+    free(name);
+    if(sem_wait(db->lock) == -1) {
+        errorexit("Error locking");
+    }
+    return 0;
 }
 
 void close_db(struct db_info *db) {
-    munmap(db->data, db->size);
+    if (sem_post(db->lock) == -1) {
+        errorexit("Error unlocking");
+    }
+    munmap(db->lock, db->size);
     close(db->fd);
 }
 
@@ -174,11 +274,14 @@ void clear() {
 
 void show() {
     struct db_info db;
-    open_db(&db);
+    if(open_db(&db) == -1) {
+        puts("The databse is empty!");
+        return;
+    }
     char *addr_copy = db.data;
     struct ip_row *row;
     for (int i = 0; i < db.size/sizeof(struct ip_row); i++) {
-        row = addr_copy;
+        row = (struct ip_row *)addr_copy;
         if(sem_wait(&row->row_lock) == -1) {
             errorexit("Error locking");
         }
@@ -203,7 +306,8 @@ int get_fd_size(int fd) {
 
 int check(char *hostname) {
     struct db_info db;
-    open_db(&db);
+    if (open_db(&db) == -1)
+        return 0;
     struct ip_row *row = (struct ip_row *)db.data;
     for (size_t i = 0; i < db.size; i++) {
         if(strncmp(hostname, row[i].row_name, NAME_SIZE) == 0) {
@@ -218,15 +322,88 @@ int check(char *hostname) {
         }
     }
     printf("No host named %s was found\n", hostname);
+    close_db(&db);
     return 0;
+}
+
+void lock(char *hostname) {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("The database is empty");
+        return;
+    }
+    struct ip_row *row = get_row(hostname, &db);
+    if (row == NULL) {
+        printf("%s is not in the database\n", hostname);
+        close_db(&db);
+        return;
+    }
+    if (sem_wait(&row->row_lock) == -1) {
+            errorexit("Could not open lock");
+    }
+    close_db(&db);
+}
+
+void unlock(char *hostname) {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("The database is empty");
+        return;
+    }
+    struct ip_row *row = get_row(hostname, &db);
+    if (row == NULL) {
+        printf("%s is not in the database\n", hostname);
+        close_db(&db);
+        return;
+    }
+    if (sem_post(&row->row_lock) == -1) {
+            errorexit("Could not open lock");
+    }
+    close_db(&db);
+}
+
+void querylock(char *hostname) {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("The database is empty");
+        return;
+    }
+    struct ip_row *row = get_row(hostname, &db);
+    if (row == NULL) {
+        printf("%s is not in the database\n", hostname);
+        close_db(&db);
+        return;
+    }
+    int semval;
+    if (sem_getvalue(&row->row_lock, &semval) == -1) {
+            errorexit("Could not open lock");
+    }
+    printf("The semaphore for %s is %s\n",
+            hostname, semval ? "unlocked" : "locked");
+    close_db(&db);
+}
+
+void querylock_table() {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("The database is empty");
+        return;
+    }
+    int semval;
+    if (sem_getvalue(db.lock, &semval) == -1) {
+            errorexit("Could not open lock");
+    }
+    printf("The semaphore for the table is %s\n", 
+            semval ? "unlocked" : "locked");
+    close_db(&db);
 }
 
 struct ip_row *get_row(char *hostname, struct db_info *db) {
     struct ip_row *row = (struct ip_row *)db->data;
-    for (size_t i = 0; i < db->size; i++) {
+    for (size_t i = 0; i < db->size/sizeof(struct ip_row); i++) {
+        write(STDOUT_FILENO, row, sizeof(struct db_info));
         if(strncmp(hostname, row[i].row_name, NAME_SIZE) == 0) {
-            return row;
-            return 1;
+            return &row[i];
         }
     }
     return NULL;
@@ -245,71 +422,85 @@ void db_map(struct db_info *db, void (func)(struct ip_row *)) {
     }
 }
 
-void save(struct db_info *db, char *file_name) {
-    int savefd = open(file_name, O_WRONLY);
-    struct ip_row *row = (struct ip_row *)db->data;
-    for (size_t i = 0; i < db->size; i++) {
-        if (sem_wait(&row->row_lock) == -1) {
+void save(char *file_name) {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("Database is empty!");
+        return;
+    }
+    printf("%s", file_name);
+    int savefd = open(file_name, O_CREAT | O_WRONLY, S_IWUSR | S_IRUSR);
+    if (savefd == -1) {
+        perror("Couldn't open file");
+        close_db(&db);
+        return;
+    }
+    struct ip_row *row = (struct ip_row *)db.data;
+    for (size_t i = 0; i < db.size/sizeof(struct ip_row); i++) {
+        if (sem_wait(&row[i].row_lock) == -1) {
             errorexit("Could not open lock");
         }
-        if (write(savefd, row, sizeof(struct ip_row)) == -1) {
+        if (write(savefd, &row[i], sizeof(struct ip_row)) == -1) {
             errorexit("Could not write to savefile");
         }
-        if (sem_post(&row->row_lock) == -1) {
+        if (sem_post(&row[i].row_lock) == -1) {
             errorexit("Could not close lock");
         }
     }
     close(savefd);
+    close_db(&db);
 }
 
-
-
-/*
-
-void show(char *hostname, char* shm, size_t shm_len) {
-    if (shm_len == 0) {
-        puts("Database is empty");
+void load(char *file_name) {
+    struct db_info db;
+    if (open_db(&db) != -1) {
+        puts("Database is not empty!");
+        close_db(&db);
         return;
     }
-    struct ip_row *row = (struct ip_row *)shm;
-    for (size_t i = 0; i < shm_len; i++) {
-        //acquire lock
-        //print
+    int savefd = open(file_name, O_RDONLY);
+    struct ip_row row;
+    ssize_t read_bytes;
+    while ((read_bytes = read(savefd, &row,
+                    sizeof(struct ip_row))) == sizeof(struct ip_row)) {
+        append_row(&row);
     }
+    close(savefd);
 }
 
-void lock_row(char *hostname, char *shm, size_t shm_len) {
-    struct ip_row *row = (struct ip_row *)shm;
-    for (size_t i = 0; i < shm_len; i++) {
-        if(strncmp(hostname, row[i].row_name, NAME_SIZE) == 0) {
-            //acquire lock
-            //return
-        }
+void lock_table() {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("Database is empty!");
+        return;
     }
-    printf("No host named %s was found\n", hostname);
-    return -1;
+    if (sem_wait(db.lock) == -1) {
+        errorexit("Could not lock the db");
+    }
+    close_db(&db);
 }
 
-void unlock_row(char *hostname, char *shm, size_t shm_len) {
-    struct ip_row *row = (struct ip_row *)shm;
-    for (size_t i = 0; i < shm_len; i++) {
-        if(strncmp(hostname, row[i].row_name, NAME_SIZE) == 0) {
-            //acquire lock
-            //return
-        }
+void unlock_table() {
+    struct db_info db;
+    if (open_db(&db) == -1) {
+        puts("Database is empty!");
+        return;
     }
-    printf("No host named %s was found\n", hostname);
-    return -1;
+    if (sem_post(db.lock) == -1) {
+        errorexit("Could not lock the db");
+    }
+    close_db(&db);   
 }
 
-int exit(char* shm_name) {
-    if (shm_unlink(shm_name) == -1) {
+int cmd_exit() {
+    char name[NAME_SIZE];
+    SHARED_MEM_NAME(name);
+    if (shm_unlink(name) == -1) {
         errorexit("unlink");
         exit(-1);
     }
     exit(0);
 }
-*/
 
 void errorexit(char *message) {
     perror(message);
