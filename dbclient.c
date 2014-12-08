@@ -493,6 +493,17 @@ void unlock_table() {
 }
 
 int cmd_exit() {
+    struct db_info db;
+    // destroy semaphores
+    if (open_db(&db) != -1) {
+        struct ip_row *row = (struct ip_row *)db.data;
+        for (size_t i = 0; i < db.size/sizeof(struct ip_row); i++) {
+            if (sem_destroy(&row[i].row_lock) == -1) {
+                errorexit("sem_destroy");
+            }
+        }
+        close_db(&db);
+    }
     char name[NAME_SIZE];
     SHARED_MEM_NAME(name);
     if (shm_unlink(name) == -1) {
