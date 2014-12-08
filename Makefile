@@ -1,7 +1,7 @@
 CC=clang
 CFLAGS=  -O0 -Wall -Wextra -g -std=c99
 
-all: dbclient
+all: dbclient sockets
 
 dbclient:
 	$(CC) dbclient.c -o dbclient $(CFLAGS)
@@ -12,4 +12,6 @@ sockets:
 
 clean:
 	rm -f dbclient
+	rm -f client
+	rm -f server
 	rm -rf *dSYM
