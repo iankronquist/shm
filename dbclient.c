@@ -54,6 +54,7 @@ void load(char *file_name);
 void lock_table();
 void unlock_table();
 void querylock_table();
+int force_open_db(struct db_info *db);
 
 int main() {
     repl();
@@ -76,17 +77,11 @@ void repl() {
             show();
         } else if(strstr(line, "exit")) {
             cmd_exit();
-        } else if(strstr(line, "lock_table")) {
-            //TODO fix design flaw: open_db locks whole table
-            puts("broken");
-            lock_table();
         } else if(strstr(line, "unlock_table")) {
-            //TODO fix design flaw: open_db locks whole table
-            puts("broken");
             unlock_table();
+        } else if(strstr(line, "lock_table")) {
+            lock_table();
         } else if(strstr(line, "query_table")) {
-            puts("broken?");
-            //TODO fix design flaw: open_db locks whole table
             querylock_table();
         } else if(strstr(line, "unlock")) {
             unlock(&line[7]);
@@ -256,6 +251,11 @@ int open_db(struct db_info *db) {
     return 0;
 }
 
+void force_close_db(struct db_info *db) {
+    munmap(db->lock, db->size);
+    close(db->fd);
+}
+
 void close_db(struct db_info *db) {
     if (sem_post(db->lock) == -1) {
         errorexit("Error unlocking");
@@ -385,7 +385,7 @@ void querylock(char *hostname) {
 
 void querylock_table() {
     struct db_info db;
-    if (open_db(&db) == -1) {
+    if (force_open_db(&db) == -1) {
         puts("The database is empty");
         return;
     }
@@ -395,7 +395,7 @@ void querylock_table() {
     }
     printf("The semaphore for the table is %s\n", 
             semval ? "unlocked" : "locked");
-    close_db(&db);
+    force_close_db(&db);
 }
 
 struct ip_row *get_row(char *hostname, struct db_info *db) {
@@ -470,26 +470,26 @@ void load(char *file_name) {
 
 void lock_table() {
     struct db_info db;
-    if (open_db(&db) == -1) {
+    if (force_open_db(&db) == -1) {
         puts("Database is empty!");
         return;
     }
     if (sem_wait(db.lock) == -1) {
         errorexit("Could not lock the db");
     }
-    close_db(&db);
+    force_close_db(&db);
 }
 
 void unlock_table() {
     struct db_info db;
-    if (open_db(&db) == -1) {
+    if (force_open_db(&db) == -1) {
         puts("Database is empty!");
         return;
     }
     if (sem_post(db.lock) == -1) {
-        errorexit("Could not lock the db");
+        errorexit("Could not unlock the db");
     }
-    close_db(&db);   
+    force_close_db(&db);   
 }
 
 int cmd_exit() {
@@ -516,4 +516,31 @@ int cmd_exit() {
 void errorexit(char *message) {
     perror(message);
     exit(-1);
+}
+
+int force_open_db(struct db_info *db) {
+    char *name = malloc(NAME_SIZE);
+    SHARED_MEM_NAME(name);
+ 
+    db->fd = shm_open(name, O_CREAT | O_RDWR, S_IWUSR | S_IRUSR);
+    if (db->fd == -1) {
+       errorexit("shm_open");
+    }
+
+    db->size = get_fd_size(db->fd);
+
+    if (db->size == 0) {
+       close(db->fd);
+       return -1;
+    }
+    if (ftruncate(db->fd, db->size) == -1) {
+        errorexit("ftruncate");
+    }
+    db->lock = mmap(NULL, db->size, PROT_READ | PROT_WRITE, MAP_SHARED, db->fd, 0);
+    db->data = db->lock + sizeof(sem_t);
+    if (db->data == (char *)-1) {
+        errorexit("mmap failed");
+    }
+    free(name);
+    return 0;
 }
