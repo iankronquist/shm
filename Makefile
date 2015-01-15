@@ -1,4 +1,4 @@
-CC=clang
+CC=gcc
 CFLAGS=  -O0 -Wall -Wextra -g -std=c99
 
 all: dbclient sockets
